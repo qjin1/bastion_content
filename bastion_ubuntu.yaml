@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Bastion ASG on Ubuntu
+Metadata: {}
+Mappings: {}
+
+ 
+Parameters:
+       
+  BastionVPC:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC id
+  
+  SubnetId:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: choose public subnet Only
+
+
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  
+  DNS:
+    Description: Name of my HostedZoneName
+    Type: String
+    ConstraintDescription: choose one existing HostedZoneName.
+
+  DNSZoneID:
+    Description: Name of my HostedZoneID
+    Type: AWS::Route53::HostedZone::Id
+    ConstraintDescription: choose one existing ZoneID.
+  
+  CronSetup:
+    Description: the minute scheduled in cron job
+    Type: Number
+    ConstraintDescription: input a number <= 60
+  
+Resources: 
+     
+  BastionSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties: 
+      GroupDescription: allow port 22 for ssh from Sanoma public IPs
+      VpcId: !Ref BastionVPC
+      SecurityGroupIngress:
+        - ToPort: '22'
+          IpProtocol: tcp
+          FromPort: '22'
+          CidrIp: 158.127.0.0/16
+        - ToPort: '22'
+          IpProtocol: tcp
+          FromPort: '22'
+          CidrIp: 193.110.235.116/32
+        - ToPort: '22'
+          IpProtocol: tcp
+          FromPort: '22'
+          CidrIp: 212.0.229.114/32
+        - ToPort: '22'
+          IpProtocol: tcp
+          FromPort: '22'
+          CidrIp: 195.165.77.128/25
+        - ToPort: '22'
+          IpProtocol: tcp
+          FromPort: '22'
+          CidrIp: 193.110.235.112/28
+          
+  BastionInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+       - !Ref BastionUserRole
+
+  BastionUserRole: 
+    Type: "AWS::IAM::Role"
+    Properties: 
+      RoleName: base-bastion-role
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "ec2.amazonaws.com"
+                #- "ssm.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+  RolePolicies: 
+    Type: "AWS::IAM::Policy"
+    Properties: 
+      PolicyName: base-application-bastion-control
+      PolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: 
+              - ec2:AllocateAddress
+              - ec2:AssociateAddress
+              - ec2:DescribeAddresses
+              - ec2:DisassociateAddress
+            Resource: "*"
+          - Effect: Allow
+            Action: 
+              - s3:GetBucketLocation
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource:
+              - !Join ['', ['arn:aws:s3:::', !ImportValue 'The-PubKeyBucket', '/*']]
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource:
+              - !Join ['', ['arn:aws:s3:::', 'snm-bastion', '/*']]        
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource:
+              - !Join ['', ['arn:aws:s3:::', !ImportValue 'The-PubKeyBucket'] ]
+              - !Join ['', ['arn:aws:s3:::', 'snm-bastion'] ]
+      Roles:
+      - !Ref BastionUserRole
+           
+          
+  BastionEIP:
+    Type: 'AWS::EC2::EIP'
+    
+  BastionASGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AvailabilityZones: !GetAZs eu-west-1
+      VPCZoneIdentifier: !Ref SubnetId
+      LaunchConfigurationName: !Ref 'BastionServerLaunchConfig'
+      DesiredCapacity: 1
+      MinSize: 1
+      MaxSize: 1
+       
+  BastionServerLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      InstanceType: t2.micro
+      ImageId: ami-785db401
+      KeyName: !Ref 'KeyName'
+      SecurityGroups: 
+       - !Ref BastionSG
+      IamInstanceProfile: !Ref BastionInstanceProfile
+      AssociatePublicIpAddress: true
+      UserData:
+        Fn::Base64: !Sub
+          - |
+              #!/bin/bash -x
+              apt-get update && apt-mark hold grub-legacy-ec2 && apt-get -y upgrade
+              apt-get -y install software-properties-common
+              apt-add-repository -y ppa:ansible/ansible
+              apt-get -y install ansible
+              apt-get -y install unzip
+              curl "https://s3.amazonaws.com/aws-cli/awscli-bundle.zip" -o "awscli-bundle.zip"
+              unzip awscli-bundle.zip
+              ./awscli-bundle/install -i /usr/local/aws -b /usr/local/bin/aws
+              aws --region eu-west-1 ec2 associate-address --public-ip ${BastionEIP} --instance-id $(ec2metadata --instance-id)  --allow-reassociation
+              wget https://s3-eu-west-1.amazonaws.com/amazon-ssm-eu-west-1/latest/debian_amd64/amazon-ssm-agent.deb
+              dpkg -i amazon-ssm-agent.deb
+              systemctl enable amazon-ssm-agent && systemctl start amazon-ssm-agent
+              echo `hostname` ansible_connection=local >> /etc/ansible/hosts 
+              /usr/local/bin/aws s3 sync s3://snm-bastion/ /etc/ansible/
+              sed -i 's/newbucket/'"${TheBastionBucket}"'/g' /etc/ansible/keyupdate.sh
+              sed -i '$ s/1/'"${Cron_var}"'/' /etc/ansible/cronjob_file
+              chmod +x /etc/ansible/keyupdate.sh && mv /etc/ansible/cronjob_file /etc/cron.d/
+              (crontab -l; echo "0 0 * * 0 root (apt-get update && apt-get -y upgrade) > /dev/null") | crontab -
+          - { Cron_var: !Ref CronSetup, TheBastionBucket: {'Fn::ImportValue': 'The-PubKeyBucket' }}
+              
+  BastionInstanceDNSRecord:
+    Type:   	
+    Properties:
+      HostedZoneId: !Ref DNSZoneID
+      Comment: DNS name for Bastion host
+      Name: !Join ['.', ["bastion", !Ref DNS]]
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+      - !Ref BastionEIP
+
+Outputs:
+
+  BastionIP:
+    Description: the holy server IP
+    Value: !Ref BastionEIP
+    Export:
+      Name: !Join ["-", [ "BastionPublicIP", !Ref "AWS::StackName"]]
+
+  AZ:
+    Description: HostedZoneId
+    Value: !Ref DNS
+    Export:
+      Name: !Join ["-", [ "HostedZoneId", !Ref "AWS::StackName"]]
+      
+  Crontime:
+    Description: time interval (minutes) for public key update
+    Value: !Ref CronSetup
+    Export:
+      Name: !Join ["-", [ "CronInterval", !Ref "AWS::StackName"]]
+    
+   
+   
