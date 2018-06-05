@@ -1,0 +1,8 @@
+- hosts: localhost
+  user: root
+
+  tasks:
+  - user:
+      name: olduser
+      state: absent
+      remove: yes
